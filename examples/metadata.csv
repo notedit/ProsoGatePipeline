@@ -1,0 +1,3 @@
+audio_path,speaker_id,language,domain,recording_type,transcript_path
+examples/audio/spk001/session_001.wav,spk001,zh,casual,studio,examples/text/spk001/session_001.txt
+examples/audio/spk002/session_001.wav,spk002,zh,tech,studio,examples/text/spk002/session_001.txt

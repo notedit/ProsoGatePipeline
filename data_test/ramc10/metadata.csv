@@ -1,0 +1,11 @@
+audio_path,speaker_id,language,domain,recording_type,transcript_path
+data_test/ramc10/audio/CTS-CN-F2F-2019-11-11-198.wav,multi,zh,conversation,interview,
+data_test/ramc10/audio/CTS-CN-F2F-2019-11-11-193.wav,multi,zh,conversation,interview,
+data_test/ramc10/audio/CTS-CN-F2F-2019-11-15-68.wav,multi,zh,conversation,interview,
+data_test/ramc10/audio/CTS-CN-F2F-2019-11-15-73.wav,multi,zh,conversation,interview,
+data_test/ramc10/audio/CTS-CN-F2F-2019-11-15-142.wav,multi,zh,conversation,interview,
+data_test/ramc10/audio/CTS-CN-F2F-2019-11-04-387.wav,multi,zh,conversation,interview,
+data_test/ramc10/audio/CTS-CN-F2F-2019-11-15-8.wav,multi,zh,conversation,interview,
+data_test/ramc10/audio/CTS-CN-F2F-2019-11-15-56.wav,multi,zh,conversation,interview,
+data_test/ramc10/audio/CTS-CN-F2F-2019-11-15-138.wav,multi,zh,conversation,interview,
+data_test/ramc10/audio/CTS-CN-F2F-2019-11-15-135.wav,multi,zh,conversation,interview,

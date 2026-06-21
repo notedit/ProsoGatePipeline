@@ -1,0 +1,161 @@
+project: prosogate
+paths:
+  work_root: work_ramc10
+  output_root: tts_dataset_ramc10
+  manifests:
+    ingest: work_ramc10/01_ingest.jsonl
+    audio_qc: work_ramc10/02_audio_qc.jsonl
+    resample: work_ramc10/03_resample.jsonl
+    vad_coarse: work_ramc10/04_vad_coarse.jsonl
+    asr: work_ramc10/05_asr.jsonl
+    text_normalize: work_ramc10/06_text_normalize.jsonl
+    align: work_ramc10/07_align.jsonl
+    fine_segment: work_ramc10/08_fine_segment.jsonl
+    spk_consistency: work_ramc10/09_spk_consistency.jsonl
+    f0: work_ramc10/10_f0.jsonl
+    rate: work_ramc10/11_rate.jsonl
+    filter_score: work_ramc10/12_filter_score.jsonl
+input:
+  metadata_csv: data_test/ramc10/metadata.csv
+  audio_root: data_test/ramc10/audio
+  text_root: ''
+audio_qc:
+  studio:
+    min_snr_db: 20
+    max_clipping_ratio: 0.001
+    min_effective_bw_hz: 7500
+  podcast:
+    min_snr_db: 12
+    max_clipping_ratio: 0.005
+    min_effective_bw_hz: 6000
+  interview:
+    min_snr_db: 8
+    max_clipping_ratio: 0.005
+    min_effective_bw_hz: 1000
+  field:
+    min_snr_db: 8
+    max_clipping_ratio: 0.01
+    min_effective_bw_hz: 6000
+  loudness_lufs_range:
+  - -45
+  - -10
+  min_duration_sec: 30
+  smoke_test: false
+resample:
+  training_sr: 24000
+  alignment_sr: 16000
+vad_coarse:
+  min_silence_ms: 500
+  min_segment_sec: 3
+  max_segment_sec: 30
+  diarization:
+    enabled: true
+    model: models/pyannote/pyannote--speaker-diarization-community-1/config.yaml
+    snap_to_silence_ms: 200
+    min_diar_confidence: 0.6
+asr:
+  model: Qwen3-ASR-1.7B
+  language: zh
+  with_punctuation: true
+  batch_size: 8
+  max_input_sec: 30
+  device: cuda
+  use_mock: false
+align:
+  model: Qwen3-ForcedAligner-0.6B
+  granularity_ms: 50
+  latency_offset_ms: 0
+  audio_sample_rate: 16000
+  min_char_confidence: 0.6
+  min_high_conf_char_ratio: 0.85
+  max_text_audio_duration_ratio: 1.4
+  min_text_audio_duration_ratio: 0.6
+  use_mock: false
+fine_segment:
+  min_duration: 3.0
+  max_duration: 20.0
+  preferred_min: 5.0
+  preferred_max: 15.0
+  punctuation_silence_ms: 200
+spk_consistency:
+  embedding_model: models/pyannote/pyannote--embedding/pytorch_model.bin
+  window_sec: 1.5
+  hop_sec: 0.25
+  min_windows: 4
+  exclude_silence: true
+  thresholds:
+    cluster_silhouette: 0.35
+    max_dist_to_center: 0.75
+    max_neighbor_delta: 0.6
+    consecutive_neighbor_delta: 0.45
+    ref_outlier_ratio: 1.01
+    overlap_ratio: 0.02
+  enrollment:
+    topk_per_speaker: 20
+    update_min_score: 0.85
+  use_mock: false
+f0:
+  frame_hop_ms: 10
+  bootstrap:
+    f0_min: 60
+    f0_max: 600
+  speaker_adaptive_range:
+    factor_low: 0.5
+    factor_high: 2.0
+  filter:
+    min_voiced_ratio: 0.45
+    min_f0_confidence: 0.75
+    max_f0_delta_p95_st: 6.0
+    min_f0_std_st: 1.0
+    max_f0_std_st: 10.0
+    min_f0_range_st: 3.0
+    max_f0_range_st: 20.0
+  speaker_adaptive:
+    enabled: true
+    min_samples_per_speaker: 200
+    keep_percentile:
+    - 10
+    - 95
+rate:
+  window_chars: 6
+  step_chars: 3
+  min_chars_for_local: 12
+  filter:
+    min_global_rate_cps: 2.0
+    max_global_rate_cps: 8.0
+    min_local_rate_cv: 0.06
+    max_local_rate_cv: 0.65
+    max_pause_ratio: 0.45
+    max_long_pause_count_per_15s: 2
+score:
+  weights:
+    audio: 0.25
+    align: 0.2
+    pitch: 0.25
+    rate: 0.2
+    text: 0.1
+  pitch_optimal_std_st_range:
+  - 2.0
+  - 6.0
+  pitch_delta_p95_full_score_range:
+  - 0.0
+  - 4.0
+  pitch_delta_p95_zero_at: 6.0
+  rate_optimal_cps_range:
+  - 3.5
+  - 6.0
+  rate_optimal_cv_range:
+  - 0.12
+  - 0.45
+  grade_thresholds:
+    A: 0.85
+    B: 0.75
+    C: 0.6
+split:
+  ratios:
+    train: 0.92
+    valid: 0.04
+    test: 0.04
+  speaker_holdout: false
+  dedup_similarity: 0.9
+  random_seed: 42

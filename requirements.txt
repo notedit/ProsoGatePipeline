@@ -1,0 +1,33 @@
+# Core
+pyyaml>=6.0
+numpy>=1.24
+soundfile>=0.12
+librosa>=0.10
+tqdm>=4.66
+
+# Audio QC / VAD
+pyloudnorm>=0.1.1
+silero-vad>=5.1
+
+# ASR / Alignment (Qwen3 via transformers/modelscope)
+transformers>=4.45
+torch>=2.1
+torchaudio>=2.1
+
+# Diarization & speaker embeddings
+pyannote.audio>=3.1
+
+# F0
+pyworld>=0.3.4
+
+# Text normalization (zh)
+opencc>=1.1.7
+cn2an>=0.5.22
+
+# Reports
+matplotlib>=3.7
+pandas>=2.0
+jinja2>=3.1
+
+# CLI
+click>=8.1

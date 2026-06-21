@@ -216,3 +216,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ProsoGate intermediate outputs
+work/
+work_*/
+tts_dataset/
+tts_dataset_*/
+
+# Local model snapshots (HF gated, restore via scripts/download_pyannote.py)
+models/pyannote/
+
+# Test datasets — local symlinks to /workspace/data, regenerate via scripts/*_to_manifest.py
+data_test/*/audio/
+
+# Smoke synthetic audio (regenerate via scripts/gen_smoke_data.py)
+examples/audio/
+
+# Cached pyannote pipeline.local.yaml created on first GPU load
+models/pyannote/**/config.local.yaml
