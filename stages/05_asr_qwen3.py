@@ -35,53 +35,76 @@ PLACEHOLDER_TEXT = "测试音频片段一二三"
 def _try_load_real_backend(cfg: Any):
     """Build an HTTP client for the Qwen3-ASR service.
 
-    Server contract (per project README):
+    Single endpoint:
       POST /v1/audio/transcriptions
         file=@wav, language=<lang>, response_format=verbose_json,
         timestamp_granularities[]=word
-      ->  {text, language, words:[{word,start,end}], duration}
+      ->  {text, words:[{word,start,end}], duration}
 
-    Returns a callable(audio_bytes_or_path, sr_unused) -> (text, conf, words[]).
-    We pass the original wav path when available (the server still re-reads but
-    we keep word timestamps without re-encoding); fall back to file upload of
-    sliced audio when path mode isn't safe.
+    Batch endpoint (preferred when batch_size > 1):
+      POST /v1/audio/transcriptions/batch
+        audio_files[]=@wav...  (one inference call, ~5x speedup at batch=16)
+      ->  {results: [TranscriptionResponse, ...]}    # order preserved
+
+    Returns dict with callables:
+      single: (audio, sr) -> (text, words[])
+      batch : (list[(audio, sr)]) -> list[(text, words[])]    or None if unsupported
     """
     try:
-        import requests  # noqa: F401  -- verify the package is importable
+        import requests  # noqa: F401
     except ImportError as e:
         log.warning(f"requests unavailable ({e}); cannot reach Qwen3-ASR HTTP server")
         return None
 
-    endpoint = cfg.asr.get("endpoint", "http://127.0.0.1:18765/v1/audio/transcriptions")
+    base_url = cfg.asr.get("base_url", "http://127.0.0.1:18765")
+    # Back-compat: if config sets the older `endpoint` field, derive base from it.
+    legacy_endpoint = cfg.asr.get("endpoint", "")
+    if legacy_endpoint:
+        # strip path suffix
+        base_url = legacy_endpoint.rsplit("/v1/", 1)[0] if "/v1/" in legacy_endpoint else base_url
     language = cfg.asr.get("language", "zh")
-    timeout = float(cfg.asr.get("timeout_sec", 60))
-    log.info(f"Qwen3-ASR HTTP client -> {endpoint} (lang={language})")
+    timeout = float(cfg.asr.get("timeout_sec", 120))
+    log.info(f"Qwen3-ASR HTTP client -> {base_url} (lang={language})")
 
     import io as _io
     import soundfile as _sf
     import requests as _rq
 
-    def _infer(audio: np.ndarray, sr: int) -> tuple[str, float, list[dict]]:
-        # Upload sliced audio as wav bytes
+    single_url = f"{base_url}/v1/audio/transcriptions"
+    batch_url = f"{base_url}/v1/audio/transcriptions/batch"
+    common_data = {
+        "language": language,
+        "response_format": "verbose_json",
+        "timestamp_granularities[]": "word",
+    }
+
+    def _wav_bytes(audio: np.ndarray, sr: int) -> bytes:
         buf = _io.BytesIO()
         _sf.write(buf, audio, sr, subtype="PCM_16", format="WAV")
-        buf.seek(0)
-        files = {"file": ("clip.wav", buf, "audio/wav")}
-        data = {
-            "language": language,
-            "response_format": "verbose_json",
-            "timestamp_granularities[]": "word",
-        }
-        r = _rq.post(endpoint, files=files, data=data, timeout=timeout)
+        return buf.getvalue()
+
+    def _single(audio: np.ndarray, sr: int) -> tuple[str, list[dict]]:
+        files = {"file": ("clip.wav", _wav_bytes(audio, sr), "audio/wav")}
+        r = _rq.post(single_url, files=files, data=common_data, timeout=timeout)
         r.raise_for_status()
-        payload = r.json()
-        text = (payload.get("text") or "").strip()
-        words = payload.get("words") or []
-        return text, 0.95, words
+        p = r.json()
+        return (p.get("text") or "").strip(), p.get("words") or []
 
-    return _infer
+    def _batch(items: list[tuple[np.ndarray, int]]) -> list[tuple[str, list[dict]]]:
+        files = [
+            ("audio_files", (f"c{i}.wav", _wav_bytes(a, sr), "audio/wav"))
+            for i, (a, sr) in enumerate(items)
+        ]
+        r = _rq.post(batch_url, files=files, data=common_data, timeout=timeout)
+        r.raise_for_status()
+        results = r.json().get("results") or []
+        if len(results) != len(items):
+            raise RuntimeError(
+                f"batch endpoint returned {len(results)} results for {len(items)} inputs"
+            )
+        return [((p.get("text") or "").strip(), p.get("words") or []) for p in results]
 
-
+    return {"single": _single, "batch": _batch}
 def _read_manual_text(transcript_path: str | None) -> str | None:
     if not transcript_path:
         return None
@@ -99,8 +122,10 @@ def _mock_transcribe_segment(
     seg: dict[str, Any],
     source_durations: dict[str, float],
     transcripts: dict[str, str],
-) -> tuple[str, float]:
-    """Deterministic mock: linear character slice of manual text by [start, end] ratio."""
+) -> str:
+    """Deterministic mock: linear character slice of manual text by [start, end] ratio.
+    Returns text only (no confidence — the real service's confidence is a hardcoded
+    constant and downstream stages do not use it)."""
     src_id = seg.get("source_audio_id") or ""
     manual = transcripts.get(src_id)
     src_dur = source_durations.get(src_id, 0.0)
@@ -114,8 +139,8 @@ def _mock_transcribe_segment(
         e_idx = max(s_idx, min(n_chars, e_idx))
         sliced = manual[s_idx:e_idx].strip()
         if sliced:
-            return sliced, 0.95
-    return PLACEHOLDER_TEXT, 0.95
+            return sliced
+    return PLACEHOLDER_TEXT
 
 
 def run(cfg: Any) -> int:
@@ -172,14 +197,17 @@ def run(cfg: Any) -> int:
 
     out_records: list[dict[str, Any]] = []
     cache_audio: dict[str, tuple[np.ndarray, int]] = {}
+    batch_size = int(cfg.asr.get("batch_size", 16))
 
+    # First pass: classify each seg.
+    #   pending_idx[i] -> indices in out_records that need ASR (real or mock).
     n_rejected = 0
+    pending: list[tuple[int, dict[str, Any]]] = []  # (out_records index, rec)
     for seg in segs:
         rec = dict(seg)
+        out_records.append(rec)
         if rec.get("status") == "rejected":
-            out_records.append(rec)
             continue
-
         duration = float(rec.get("duration") or 0.0)
         if duration > max_input_sec:
             log.warning(
@@ -187,47 +215,69 @@ def run(cfg: Any) -> int:
             )
             add_reject(rec, f"asr_duration_gt_{max_input_sec}")
             n_rejected += 1
-            out_records.append(rec)
             continue
-
         align_path = rec.get("audio_align_path")
         if not align_path or not Path(align_path).exists():
             add_reject(rec, "asr_align_audio_missing")
             n_rejected += 1
-            out_records.append(rec)
             continue
+        pending.append((len(out_records) - 1, rec))
 
-        if real_infer is not None:
-            try:
-                if align_path not in cache_audio:
-                    cache_audio[align_path] = read_wav(align_path, target_sr=16000)
-                audio, sr = cache_audio[align_path]
-                clip = slice_audio(audio, sr, float(rec["start"]), float(rec["end"]))
-                result = real_infer(clip, sr)
-                # Real backend returns (text, conf, words); mock returns (text, conf)
-                if len(result) == 3:
-                    text, conf, words = result
-                    if words:
-                        rec["asr_words"] = words
-                else:
-                    text, conf = result
-            except Exception as e:
-                log.warning(f"real ASR failed on seg {rec.get('seg_id')}: {e}; falling back to mock")
-                text, conf = _mock_transcribe_segment(rec, source_durations, transcripts)
-        else:
-            text, conf = _mock_transcribe_segment(rec, source_durations, transcripts)
+    log.info(f"asr: {len(pending)} segs need transcription (batch_size={batch_size})")
 
-        rec["asr_text"] = text
-        rec["asr_confidence"] = float(conf)
-        # Propagate transcript_path for downstream stages (06 normalize) when recovered.
+    def _propagate_transcript(rec: dict[str, Any]) -> None:
         if not rec.get("transcript_path"):
             sid = rec.get("source_audio_id")
             if sid and sid in audio_id_to_transcript:
                 rec["transcript_path"] = audio_id_to_transcript[sid]
-        # NOTE: Whisper-large-v3 cross-check (design.md §5) is intentionally a real-only
-        # path; in mock mode we skip it. When implementing the real backend, run a
-        # second-pass transcription and reject if CER > 12% with no manual text.
-        out_records.append(rec)
+
+    if real_infer is not None and pending:
+        single_fn = real_infer["single"]
+        batch_fn = real_infer["batch"]
+        # Materialize all clips into memory once per source audio.
+        clips: list[tuple[np.ndarray, int]] = []
+        for _, rec in pending:
+            ap = rec["audio_align_path"]
+            if ap not in cache_audio:
+                cache_audio[ap] = read_wav(ap, target_sr=16000)
+            audio, sr = cache_audio[ap]
+            clip = slice_audio(audio, sr, float(rec["start"]), float(rec["end"]))
+            clips.append((clip, sr))
+
+        for b_start in range(0, len(pending), batch_size):
+            chunk = pending[b_start : b_start + batch_size]
+            chunk_clips = clips[b_start : b_start + batch_size]
+            try:
+                results = batch_fn(chunk_clips)
+            except Exception as e:
+                log.warning(
+                    f"batch ASR failed at offset {b_start} (size={len(chunk)}): {e}; "
+                    f"falling back to per-seg single calls"
+                )
+                results = []
+                for (idx, rec), (audio, sr) in zip(chunk, chunk_clips):
+                    try:
+                        results.append(single_fn(audio, sr))
+                    except Exception as e2:
+                        log.warning(f"single ASR failed on seg {rec.get('seg_id')}: {e2}; mock fallback")
+                        text = _mock_transcribe_segment(rec, source_durations, transcripts)
+                        results.append((text, []))
+            for (idx, rec), (text, words) in zip(chunk, results):
+                rec["asr_text"] = text
+                if words:
+                    rec["asr_words"] = words
+                _propagate_transcript(rec)
+    else:
+        # Mock path (no real backend).
+        for _, rec in pending:
+            rec["asr_text"] = _mock_transcribe_segment(rec, source_durations, transcripts)
+            _propagate_transcript(rec)
+
+    # asr_confidence is intentionally NOT recorded: the HTTP service returns
+    # a hardcoded 0.95 and the mock returns text-only — no signal. Stage 12
+    # uses timing-derived align_quality_score instead.
+    # NOTE: Whisper-large-v3 cross-check (design.md §5) is intentionally a real-only
+    # path; in mock mode we skip it.
 
     n = write_jsonl(out_path, out_records)
     log.info(f"wrote {n} segs to {out_path} (rejected={n_rejected})")

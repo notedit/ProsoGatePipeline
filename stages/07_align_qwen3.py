@@ -34,13 +34,19 @@ log = get_logger(__name__)
 def _try_load_real_backend(cfg: Any):
     """Build an HTTP client for the Qwen3-ForcedAligner service.
 
-    Server contract:
+    Single endpoint:
       POST /v1/audio/forced_alignment
-        file=@wav, text=<known transcript>, language=<lang>
-      ->  {language, duration, words:[{word,start,end}]}
+        file=@wav, text=<transcript>, language=<lang>
+      ->  {duration, words:[{word,start,end}]}    # no confidence field
 
-    Returns a callable(audio, sr, text) -> list[{char,start,end,confidence}].
-    Confidence is not provided by the service; we synthesize a uniform 0.95.
+    Batch endpoint (preferred when batch_size > 1):
+      POST /v1/audio/forced_alignment/batch
+        audio_files[]=@wav...  texts[]=...  language=<lang>
+      ->  {results: [AlignmentResponse, ...]}     # order preserved
+
+    Returns dict {"single": fn, "batch": fn}. Each char dict has confidence=0.95
+    as a placeholder (server does not emit one); stage 12 ignores this and
+    derives align_quality_score from timing-only metrics.
     """
     try:
         import requests  # noqa: F401
@@ -48,27 +54,27 @@ def _try_load_real_backend(cfg: Any):
         log.warning(f"requests unavailable ({e}); cannot reach Qwen3-Aligner HTTP server")
         return None
 
-    endpoint = cfg.align.get(
-        "endpoint", "http://127.0.0.1:18765/v1/audio/forced_alignment"
-    )
+    base_url = cfg.align.get("base_url", "http://127.0.0.1:18765")
+    legacy_endpoint = cfg.align.get("endpoint", "")
+    if legacy_endpoint:
+        base_url = legacy_endpoint.rsplit("/v1/", 1)[0] if "/v1/" in legacy_endpoint else base_url
     language = cfg.align.get("language", "zh")
-    timeout = float(cfg.align.get("timeout_sec", 60))
-    log.info(f"Qwen3-ForcedAligner HTTP client -> {endpoint} (lang={language})")
+    timeout = float(cfg.align.get("timeout_sec", 120))
+    log.info(f"Qwen3-ForcedAligner HTTP client -> {base_url} (lang={language})")
 
     import io as _io
     import soundfile as _sf
     import requests as _rq
 
-    def _align(audio: np.ndarray, sr: int, text: str) -> list[dict[str, Any]]:
+    single_url = f"{base_url}/v1/audio/forced_alignment"
+    batch_url = f"{base_url}/v1/audio/forced_alignment/batch"
+
+    def _wav_bytes(audio: np.ndarray, sr: int) -> bytes:
         buf = _io.BytesIO()
         _sf.write(buf, audio, sr, subtype="PCM_16", format="WAV")
-        buf.seek(0)
-        files = {"file": ("clip.wav", buf, "audio/wav")}
-        data = {"text": text, "language": language}
-        r = _rq.post(endpoint, files=files, data=data, timeout=timeout)
-        r.raise_for_status()
-        payload = r.json()
-        words = payload.get("words") or []
+        return buf.getvalue()
+
+    def _words_to_chars(words: list[dict]) -> list[dict[str, Any]]:
         return [
             {
                 "char": str(w.get("word", "")),
@@ -80,7 +86,30 @@ def _try_load_real_backend(cfg: Any):
             if "start" in w and "end" in w
         ]
 
-    return _align
+    def _single(audio: np.ndarray, sr: int, text: str) -> list[dict[str, Any]]:
+        files = {"file": ("clip.wav", _wav_bytes(audio, sr), "audio/wav")}
+        data = {"text": text, "language": language}
+        r = _rq.post(single_url, files=files, data=data, timeout=timeout)
+        r.raise_for_status()
+        return _words_to_chars(r.json().get("words") or [])
+
+    def _batch(items: list[tuple[np.ndarray, int, str]]) -> list[list[dict[str, Any]]]:
+        files = [
+            ("audio_files", (f"c{i}.wav", _wav_bytes(a, sr), "audio/wav"))
+            for i, (a, sr, _) in enumerate(items)
+        ]
+        # texts[] is sent as repeated form fields, order matches audio_files[]
+        data = [("language", language)] + [("texts", t) for (_, _, t) in items]
+        r = _rq.post(batch_url, files=files, data=data, timeout=timeout)
+        r.raise_for_status()
+        results = r.json().get("results") or []
+        if len(results) != len(items):
+            raise RuntimeError(
+                f"batch endpoint returned {len(results)} results for {len(items)} inputs"
+            )
+        return [_words_to_chars(p.get("words") or []) for p in results]
+
+    return {"single": _single, "batch": _batch}
 
 
 def _mock_align(seg_id: str, text: str, start: float, end: float) -> list[dict[str, Any]]:
@@ -127,6 +156,7 @@ def run(cfg: Any) -> int:
     latency_offset_ms = float(cfg.align.get("latency_offset_ms", 0))
     latency_offset_sec = latency_offset_ms / 1000.0
     align_sr = int(cfg.align.get("audio_sample_rate", 16000))
+    batch_size = int(cfg.align.get("batch_size", 16))
 
     work_root = Path(cfg.paths.get("work_root", "work"))
     align_dir = work_root / "alignments"
@@ -136,55 +166,91 @@ def run(cfg: Any) -> int:
 
     cache_audio: dict[str, tuple[np.ndarray, int]] = {}
     out_records: list[dict[str, Any]] = []
+    pending: list[tuple[int, dict[str, Any], str, float, float]] = []  # (idx, rec, text, start, end)
     n_skipped = 0
 
+    # First pass: pass through rejected, route empty-text to reject, queue the rest.
     for seg in read_jsonl(in_path):
         rec = dict(seg)
+        out_records.append(rec)
         if rec.get("status") == "rejected":
-            out_records.append(rec)
             continue
-
-        seg_id = rec.get("seg_id")
         text = rec.get("text_normalized") or ""
         start = float(rec["start"])
         end = float(rec["end"])
-
         if not text.strip():
             add_reject(rec, "align_empty_text")
-            out_records.append(rec)
             n_skipped += 1
             continue
+        pending.append((len(out_records) - 1, rec, text, start, end))
 
-        chars: list[dict[str, Any]] = []
-        if real_align is not None:
+    log.info(f"align: {len(pending)} segs need alignment (batch_size={batch_size})")
+
+    # Resolve clips for each pending seg once.
+    clips: list[tuple[np.ndarray, int, str]] = []
+    if pending:
+        for _, rec, text, start, end in pending:
+            ap = rec.get("audio_align_path")
+            if ap not in cache_audio:
+                cache_audio[ap] = read_wav(ap, target_sr=align_sr)
+            audio, sr = cache_audio[ap]
+            clip = slice_audio(audio, sr, start, end)
+            clips.append((clip, sr, text))
+
+    # Inference: real batch path, with fallback per-seg single, then mock.
+    raw_chars_per_seg: list[list[dict[str, Any]] | None] = [None] * len(pending)
+    if real_align is not None and pending:
+        single_fn = real_align["single"]
+        batch_fn = real_align["batch"]
+        for b_start in range(0, len(pending), batch_size):
+            b_end = min(b_start + batch_size, len(pending))
+            chunk_items = pending[b_start:b_end]
+            chunk_clips = clips[b_start:b_end]
             try:
-                align_path = rec.get("audio_align_path")
-                if align_path not in cache_audio:
-                    cache_audio[align_path] = read_wav(align_path, target_sr=align_sr)
-                audio, sr = cache_audio[align_path]
-                clip = slice_audio(audio, sr, start, end)
-                raw = real_align(clip, sr, text)
-                # Real aligner returns timestamps relative to the clip; shift by start.
-                chars = [
-                    {
-                        "char": c["char"],
-                        "start": float(c["start"]) + start,
-                        "end": float(c["end"]) + start,
-                        "confidence": float(c.get("confidence", 0.9)),
-                    }
-                    for c in raw
-                ]
+                results = batch_fn(chunk_clips)
             except Exception as e:
-                log.warning(f"real align failed on {seg_id}: {e}; falling back to mock")
-                chars = _mock_align(seg_id, text, start, end)
+                log.warning(
+                    f"batch align failed at offset {b_start} (size={b_end - b_start}): {e}; "
+                    f"falling back to per-seg single calls"
+                )
+                results = []
+                for (idx, rec, text, _, _), (audio, sr, _) in zip(chunk_items, chunk_clips):
+                    try:
+                        results.append(single_fn(audio, sr, text))
+                    except Exception as e2:
+                        log.warning(f"single align failed on {rec.get('seg_id')}: {e2}; mock fallback")
+                        results.append(_mock_align(rec.get("seg_id"), text, pending[b_start + len(results)][3], pending[b_start + len(results)][4]))
+            for k, raw in enumerate(results):
+                raw_chars_per_seg[b_start + k] = raw
+    else:
+        # Mock path
+        for k, (_, rec, text, start, end) in enumerate(pending):
+            raw_chars_per_seg[k] = _mock_align(rec.get("seg_id"), text, start, end)
+
+    # Post-process: time-shift, latency offset, write per-seg JSON, derive metrics.
+    for k, (idx, rec, text, start, end) in enumerate(pending):
+        raw = raw_chars_per_seg[k] or []
+        seg_id = rec.get("seg_id")
+
+        if real_align is not None:
+            # Real aligner returns clip-relative times; shift to absolute.
+            chars = [
+                {
+                    "char": c["char"],
+                    "start": float(c["start"]) + start,
+                    "end": float(c["end"]) + start,
+                    "confidence": float(c.get("confidence", 0.9)),
+                }
+                for c in raw
+            ]
         else:
-            chars = _mock_align(seg_id, text, start, end)
+            # Mock already produces absolute times.
+            chars = raw
 
         chars = _apply_latency_offset(chars, latency_offset_sec, start, end)
 
         if not chars:
             add_reject(rec, "align_no_chars")
-            out_records.append(rec)
             n_skipped += 1
             continue
 
@@ -196,9 +262,13 @@ def run(cfg: Any) -> int:
 
         text_chars_n = sum(1 for c in text if c.strip())
         seg_dur = max(1e-6, end - start)
-        # text/audio duration ratio: estimated speaking-time over seg duration.
-        est_speech = sum((c["end"] - c["start"]) for c in chars)
-        text_audio_duration_ratio = float(est_speech / seg_dur) if seg_dur > 0 else 0.0
+        # Timing-derived align signals (the server confidence is hardcoded 0.95).
+        char_durs = np.array([max(0.0, c["end"] - c["start"]) for c in chars], dtype=np.float64)
+        degen_ratio = float(np.mean((char_durs < 0.02) | (char_durs > 0.5))) if len(char_durs) else 1.0
+        est_speech = float(char_durs.sum())
+        align_coverage = float(est_speech / seg_dur) if seg_dur > 0 else 0.0
+        text_audio_duration_ratio = align_coverage  # back-compat alias
+        align_char_match_ratio = float(len(chars) / text_chars_n) if text_chars_n else 0.0
 
         align_obj = {
             "seg_id": seg_id,
@@ -215,9 +285,10 @@ def run(cfg: Any) -> int:
         rec["align_conf_p10"] = align_conf_p10
         rec["high_conf_char_ratio"] = high_conf_char_ratio
         rec["text_audio_duration_ratio"] = text_audio_duration_ratio
+        rec["align_coverage"] = align_coverage
+        rec["align_degenerate_char_ratio"] = degen_ratio
+        rec["align_char_match_ratio"] = align_char_match_ratio
         rec["n_chars"] = text_chars_n
-
-        out_records.append(rec)
 
     n = write_jsonl(out_path, out_records)
     log.info(f"wrote {n} segs to {out_path} (skipped={n_skipped})")

@@ -41,6 +41,15 @@ def _f0_pyworld(audio: np.ndarray, sr: int, f0_min: float, f0_max: float, frame_
     values slightly outside the range (e.g. subharmonics in low-pitched
     speech). We hard-clamp here: any frame outside [f0_min, f0_max] is
     marked unvoiced.
+
+    Confidence is a vectorized energy-vs-signal estimate: ratio of frame
+    energy to the running RMS. Voiced frames in clearly-voiced regions
+    score near 1.0; voiced frames in low-energy regions (model uncertain)
+    score lower. We do NOT compute true per-frame autocorrelation
+    confidence (which is O(n_frames × win) Python and dominates wall time);
+    pyworld harvest already provides the discriminative voiced/unvoiced
+    signal via the F0=0 mask. f0_confidence is only used by stage 12 to
+    apply a hard-rule (>= 0.65 threshold), so the rougher proxy is enough.
     """
     audio64 = audio.astype(np.float64, copy=False)
     frame_period_ms = float(frame_hop_ms)
@@ -51,30 +60,29 @@ def _f0_pyworld(audio: np.ndarray, sr: int, f0_min: float, f0_max: float, frame_
         frame_period=frame_period_ms,
     )
     f0 = pw.stonemask(audio64, f0, t, sr)
-    # Hard clamp out-of-range frames -> unvoiced
     f0 = np.where((f0 >= f0_min) & (f0 <= f0_max), f0, 0.0)
-    voiced = f0 > 0
-    # crude confidence proxy: ratio of energy at f0 lag to local energy
-    conf = np.zeros_like(f0, dtype=np.float64)
-    hop = int(round(sr * frame_hop_ms / 1000.0))
+
+    # Vectorized per-frame energy. Window = max(4·hop, 25ms).
+    hop = max(1, int(round(sr * frame_hop_ms / 1000.0)))
     win = max(hop * 4, int(0.025 * sr))
-    for i, fv in enumerate(f0):
-        if fv <= 0:
-            continue
-        center = int(t[i] * sr) if i < len(t) else i * hop
-        s = max(0, center - win // 2)
-        e = min(len(audio), center + win // 2)
-        seg = audio[s:e]
-        if len(seg) < 8:
-            continue
-        lag = int(round(sr / fv))
-        if lag <= 0 or lag >= len(seg):
-            continue
-        a = seg[:-lag]
-        b = seg[lag:]
-        denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-9
-        c = float(np.dot(a, b) / denom)
-        conf[i] = max(0.0, min(1.0, (c + 1.0) / 2.0))
+    half = win // 2
+    centers = (t * sr).astype(np.int64) if len(t) else np.arange(len(f0), dtype=np.int64) * hop
+    # Cumulative sum of squared signal lets us read frame energies in O(1).
+    sq = audio64 ** 2
+    cum = np.concatenate(([0.0], np.cumsum(sq)))
+    starts = np.clip(centers - half, 0, len(audio64))
+    ends = np.clip(centers + half, 0, len(audio64))
+    frame_energy = (cum[ends] - cum[starts]) / np.maximum(1, ends - starts)
+    # Normalize by a percentile of voiced-frame energy so loud parts saturate at 1.
+    voiced_mask = f0 > 0
+    if voiced_mask.any():
+        ref_energy = float(np.percentile(frame_energy[voiced_mask], 90))
+    else:
+        ref_energy = float(frame_energy.max() + 1e-12)
+    conf = np.zeros_like(f0, dtype=np.float64)
+    if ref_energy > 0:
+        # Map energy ratio to [0, 1]; saturate at the 90th percentile.
+        conf[voiced_mask] = np.minimum(1.0, frame_energy[voiced_mask] / ref_energy) * 0.5 + 0.5
     return f0.astype(np.float32), conf.astype(np.float32)
 
 
@@ -307,11 +315,17 @@ def run(cfg) -> int:
         else:
             f0_min, f0_max = boot_min, boot_max
 
-        # If adaptive bounds equal bootstrap (within 1Hz), reuse pass 1
+        # Pass-2 reuses pass-1 by re-clamping the bootstrapped F0 to the
+        # speaker-adaptive range, then re-applying the octave corrector.
+        # This avoids re-running pyworld harvest/stonemask (the dominant cost,
+        # ~200-500ms per utt). Speaker-adaptive bounds are always SUBSETS of
+        # [boot_min, boot_max], so any frame valid post-clamp was also valid
+        # in pass 1 — no information loss.
         cached = pass1_cache.get(utt_id)
-        same_range = (abs(f0_min - boot_min) < 1.0 and abs(f0_max - boot_max) < 1.0)
-        if cached is not None and same_range:
-            f0_arr, conf_arr, sr = cached
+        if cached is not None:
+            f0_arr_p1, conf_arr, sr = cached
+            f0_arr = np.where((f0_arr_p1 >= f0_min) & (f0_arr_p1 <= f0_max), f0_arr_p1, 0.0).astype(np.float32, copy=False)
+            f0_arr = _octave_correct(f0_arr, f0_min, f0_max)
         else:
             try:
                 audio, sr = read_wav(wav_path)

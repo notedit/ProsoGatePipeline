@@ -41,6 +41,37 @@ def _ramp_then_decay(value: float, full_lo: float, full_hi: float, zero_at: floa
     return max(0.0, 1.0 - (value - full_hi) / span)
 
 
+def _align_quality_score(rec: dict[str, Any]) -> float:
+    """Timing-derived align quality. The HTTP aligner ships a hardcoded 0.95
+    'confidence' so we ignore it and score on three real signals:
+      - coverage: speech-time / utt-duration (good band ~0.55-0.9 for Chinese)
+      - degenerate_char_ratio: chars with <20ms or >500ms duration (lower=better)
+      - char_match_ratio: aligned chars vs expected text chars (=1.0 ideal)
+    Falls back to align_conf_mean only if the timing signals are missing.
+    """
+    cov = rec.get("align_coverage")
+    degen = rec.get("align_degenerate_char_ratio")
+    match = rec.get("align_char_match_ratio")
+    if cov is None and degen is None and match is None:
+        # Pre-fix records — let the legacy confidence dominate so behavior degrades gracefully.
+        return float(rec.get("align_conf_mean", 0.0) or 0.0)
+    cov = float(cov or 0.0)
+    degen = float(degen if degen is not None else 1.0)
+    match = float(match if match is not None else 0.0)
+    # Coverage bell: 1.0 at 0.55-0.9, falling off outside.
+    if cov < 0.3 or cov > 1.05:
+        cov_score = 0.0
+    elif 0.55 <= cov <= 0.9:
+        cov_score = 1.0
+    elif cov < 0.55:
+        cov_score = (cov - 0.3) / (0.55 - 0.3)
+    else:
+        cov_score = max(0.0, 1.0 - (cov - 0.9) / (1.05 - 0.9))
+    degen_score = max(0.0, 1.0 - degen / 0.25)  # 0% degen -> 1.0, 25%+ -> 0
+    match_score = max(0.0, min(1.0, 1.0 - abs(1.0 - match)))
+    return float(0.5 * cov_score + 0.3 * degen_score + 0.2 * match_score)
+
+
 def _audio_quality_score(rec: dict[str, Any]) -> float:
     snr = float(rec.get("snr_db", 0.0) or 0.0)
     clip = float(rec.get("clipping_ratio", 0.0) or 0.0)
@@ -152,15 +183,39 @@ def _hard_rule_check(rec: dict[str, Any], cfg, spk_thresholds: dict[str, dict[st
     if pause_ratio > float(rate_filt.get("max_pause_ratio", 0.45)):
         reasons.append(f"pause_ratio>{rate_filt['max_pause_ratio']}")
 
-    align_conf_mean = float(rec.get("align_conf_mean", 1.0) or 0.0)
-    min_align = float(cfg.align.get_path("min_char_confidence", 0.6))
-    if align_conf_mean < min_align:
-        reasons.append(f"align_conf_mean<{min_align}")
-    high_conf_ratio = rec.get("high_conf_char_ratio")
-    if high_conf_ratio is not None:
-        min_hr = float(cfg.align.get_path("min_high_conf_char_ratio", 0.85))
-        if float(high_conf_ratio) < min_hr:
-            reasons.append(f"high_conf_char_ratio<{min_hr}")
+    # Align quality: use timing-derived signals (HTTP server returns a hardcoded
+    # 0.95 confidence so align_conf_mean alone tells us nothing).
+    cov = rec.get("align_coverage")
+    if cov is not None:
+        min_cov = float(cfg.align.get_path("min_coverage", 0.35))
+        max_cov = float(cfg.align.get_path("max_coverage", 1.05))
+        cov_v = float(cov)
+        if cov_v < min_cov:
+            reasons.append(f"align_coverage<{min_cov}")
+        if cov_v > max_cov:
+            reasons.append(f"align_coverage>{max_cov}")
+    degen = rec.get("align_degenerate_char_ratio")
+    if degen is not None:
+        max_degen = float(cfg.align.get_path("max_degenerate_char_ratio", 0.30))
+        if float(degen) > max_degen:
+            reasons.append(f"align_degenerate_char_ratio>{max_degen}")
+    match = rec.get("align_char_match_ratio")
+    if match is not None:
+        min_match = float(cfg.align.get_path("min_char_match_ratio", 0.85))
+        if float(match) < min_match:
+            reasons.append(f"align_char_match_ratio<{min_match}")
+    # Backwards compat: only fall back to the (hardcoded) confidence threshold when
+    # timing signals are missing — otherwise the server's constant 0.95 lets everything pass.
+    if cov is None and degen is None and match is None:
+        align_conf_mean = float(rec.get("align_conf_mean", 1.0) or 0.0)
+        min_align = float(cfg.align.get_path("min_char_confidence", 0.6))
+        if align_conf_mean < min_align:
+            reasons.append(f"align_conf_mean<{min_align}")
+        high_conf_ratio = rec.get("high_conf_char_ratio")
+        if high_conf_ratio is not None:
+            min_hr = float(cfg.align.get_path("min_high_conf_char_ratio", 0.85))
+            if float(high_conf_ratio) < min_hr:
+                reasons.append(f"high_conf_char_ratio<{min_hr}")
 
     return reasons
 
@@ -297,7 +352,7 @@ def run(cfg) -> int:
         reasons = _hard_rule_check(rec, cfg, spk_thresholds)
 
         audio_q = _audio_quality_score(rec)
-        align_q = float(rec.get("align_conf_mean", 0.0) or 0.0)
+        align_q = _align_quality_score(rec)
         pitch_q = _pitch_score(rec, cfg)
         rate_q = _rate_score(rec, cfg)
         text_q = _text_quality_score(rec)

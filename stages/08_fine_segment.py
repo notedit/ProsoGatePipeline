@@ -213,6 +213,25 @@ def run(cfg: Any) -> int:
                     np.mean([c.get("confidence", 0.9) for c in sub_chars])
                 ),
             }
+            # Per-utt timing-derived align signals (server confidence is hardcoded,
+            # so we compute these from the chars actually inside this utt slice).
+            char_durs = np.array(
+                [max(0.0, float(c["end"]) - float(c["start"])) for c in sub_chars],
+                dtype=np.float64,
+            )
+            est_speech = float(char_durs.sum())
+            rec["align_coverage"] = float(est_speech / duration) if duration > 0 else 0.0
+            rec["align_degenerate_char_ratio"] = (
+                float(np.mean((char_durs < 0.02) | (char_durs > 0.5))) if len(char_durs) else 1.0
+            )
+            n_text_chars = sum(1 for ch in text if ch.strip())
+            rec["align_char_match_ratio"] = (
+                float(len(sub_chars) / n_text_chars) if n_text_chars else 0.0
+            )
+            # Carry source-level QC metrics through so stage 12 scoring isn't constant.
+            for qc_k in ("snr_db", "lufs", "peak_db", "clipping_ratio", "effective_bw_hz"):
+                if seg.get(qc_k) is not None:
+                    rec[qc_k] = seg[qc_k]
 
             if duration < min_dur:
                 add_reject(rec, "duration_too_short")

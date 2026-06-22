@@ -19,7 +19,6 @@ from typing import Any
 
 import numpy as np
 
-from prosogate import cuda_preinit  # noqa: F401  -- side effect: enables CUDA on driver 535
 from prosogate.audio_io import read_wav
 from prosogate.config import Config
 from prosogate.logging_utils import get_logger
@@ -100,11 +99,8 @@ def _silences_from_speech(speech: list[dict[str, float]], total_dur: float) -> l
 # --------------------------- Diarization ---------------------------
 
 def _safe_cuda() -> bool:
-    """torch.cuda.is_available() can lie when driver/cuda mismatch — actually try.
-
-    With prosogate.cuda_preinit imported, this should return True on the
-    target host (driver 535 + cu121 torch). Without it, this returns False.
-    """
+    """Actually allocate on CUDA to confirm it works (is_available() can lie
+    when a driver/runtime mismatch is present)."""
     try:
         import torch  # type: ignore
     except ImportError:
@@ -362,6 +358,14 @@ def run(cfg: Config) -> int:
                 final_segs.append((cs, ce, lab))
 
         # 8. Emit segments
+        # Propagate source-level QC metrics so stage 12 can score audio quality
+        # per utt instead of using defaults (otherwise audio_quality_score is constant).
+        src_qc = {
+            k: rec.get(k)
+            for k in ("snr_db", "lufs", "peak_db", "clipping_ratio", "effective_bw_hz", "native_sr")
+            if rec.get(k) is not None
+        }
+
         seg_idx = 0
         for s, e, label in final_segs:
             duration = float(e - s)
@@ -380,6 +384,7 @@ def run(cfg: Config) -> int:
                 "diar_confidence": 1.0 if not diar_used else min_diar_conf,
                 "status": "passed",
                 "reject_reasons": [],
+                **src_qc,
             }
             if duration < min_seg:
                 seg_rec["status"] = "rejected"

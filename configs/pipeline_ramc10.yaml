@@ -57,7 +57,7 @@ asr:
   model: Qwen3-ASR-1.7B
   language: zh
   with_punctuation: true
-  batch_size: 8
+  batch_size: 16
   max_input_sec: 30
   device: cuda
   use_mock: false
@@ -66,6 +66,7 @@ align:
   granularity_ms: 50
   latency_offset_ms: 0
   audio_sample_rate: 16000
+  batch_size: 16
   min_char_confidence: 0.6
   min_high_conf_char_ratio: 0.85
   max_text_audio_duration_ratio: 1.4
@@ -83,12 +84,16 @@ spk_consistency:
   hop_sec: 0.25
   min_windows: 4
   exclude_silence: true
+  # Conversation-domain thresholds: same-speaker variance is naturally larger
+  # in spontaneous speech (laughter, low-volume turns, emphasis). Tighter
+  # studio defaults reject ~50% of clean RAMC samples, so we widen judges A/C
+  # while keeping the strict overlap/center/enrollment guards.
   thresholds:
-    cluster_silhouette: 0.35
+    cluster_silhouette: 0.55          # was 0.35 (studio); ramc med=0.34 p95=0.51
     max_dist_to_center: 0.75
-    max_neighbor_delta: 0.6
-    consecutive_neighbor_delta: 0.45
-    ref_outlier_ratio: 1.01
+    max_neighbor_delta: 0.75          # was 0.60; ramc p95=0.52
+    consecutive_neighbor_delta: 0.55  # was 0.45
+    ref_outlier_ratio: 1.01           # judge D disabled (no enrollment)
     overlap_ratio: 0.02
   enrollment:
     topk_per_speaker: 20
@@ -103,8 +108,10 @@ f0:
     factor_low: 0.5
     factor_high: 2.0
   filter:
-    min_voiced_ratio: 0.45
-    min_f0_confidence: 0.75
+    # Conversation-data tuned: relax voiced_ratio (pauses are normal in dialogue),
+    # f0_confidence (lower SNR than studio), and f0_range upper bound.
+    min_voiced_ratio: 0.35
+    min_f0_confidence: 0.65
     max_f0_delta_p95_st: 6.0
     min_f0_std_st: 1.0
     max_f0_std_st: 10.0
@@ -121,8 +128,9 @@ rate:
   step_chars: 3
   min_chars_for_local: 12
   filter:
+    # Conversation cps tail is higher than studio reading (people rush words).
     min_global_rate_cps: 2.0
-    max_global_rate_cps: 8.0
+    max_global_rate_cps: 9.0
     min_local_rate_cv: 0.06
     max_local_rate_cv: 0.65
     max_pause_ratio: 0.45
@@ -141,9 +149,10 @@ score:
   - 0.0
   - 4.0
   pitch_delta_p95_zero_at: 6.0
+  # Conversation tempo runs faster than studio reading; widen the "optimal" band.
   rate_optimal_cps_range:
-  - 3.5
-  - 6.0
+  - 4.0
+  - 7.5
   rate_optimal_cv_range:
   - 0.12
   - 0.45
@@ -153,9 +162,9 @@ score:
     C: 0.6
 split:
   ratios:
-    train: 0.92
-    valid: 0.04
-    test: 0.04
+    train: 0.9
+    valid: 0.05
+    test: 0.05
   speaker_holdout: false
   dedup_similarity: 0.9
   random_seed: 42

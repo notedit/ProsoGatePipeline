@@ -27,7 +27,6 @@ from typing import Any
 
 import numpy as np
 
-from prosogate import cuda_preinit  # noqa: F401  -- enable CUDA on driver 535
 from prosogate.audio_io import read_wav, slice_audio
 from prosogate.logging_utils import get_logger
 from prosogate.manifest import read_jsonl, write_jsonl

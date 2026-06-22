@@ -12,19 +12,31 @@ from prosogate.manifest import read_jsonl, write_jsonl
 log = get_logger(__name__)
 
 
-# Fields to retain in final manifests (design.md §14)
+# Final manifest schema — minimal, non-redundant.
+# Intermediate / debugging fields (pitch_score, audio_quality_score, align_coverage,
+# voiced_ratio, n_chars, local_rate_std/mean/p5_p95, f0_mean_hz, f0_range_st,
+# long_pause_count, f0_confidence, ...) stay in work_ramc10/12_filter_score.jsonl
+# for offline analysis but are dropped here so evaluation models see one
+# independent value per dimension. See docs/metrics.md.
 _KEEP_FIELDS = [
-    "utt_id", "speaker_id", "speaker_label", "wav", "text", "text_normalized",
-    "prev_text", "next_text", "duration", "sample_rate", "source_audio_id",
-    "source_audio", "start", "end",
-    "align_conf_mean", "high_conf_char_ratio", "alignment_json_path",
-    "f0_mean_hz", "f0_median_hz", "f0_std_st", "f0_range_st", "f0_delta_p95_st",
-    "voiced_ratio", "f0_confidence", "f0_npy_path",
-    "global_rate_cps", "local_rate_mean", "local_rate_std", "local_rate_cv",
-    "local_rate_p5_p95_range", "pause_ratio", "long_pause_count", "n_chars",
-    "audio_quality_score", "align_quality_score", "pitch_score", "rate_score",
-    "text_quality_score", "quality_score", "grade", "prosody_bucket",
+    # Identity / file paths
+    "utt_id", "speaker_id", "speaker_label", "source_audio_id",
+    "wav", "sample_rate", "duration", "start", "end",
+    "alignment_json_path", "f0_npy_path",
+    # Text
+    "text", "prev_text", "next_text",
+    # Prosody core (6 independent dimensions)
+    "f0_median_hz",       # speaker pitch level (Hz)
+    "f0_std_st",          # within-utt pitch spread (semitone)
+    "f0_delta_p95_st",    # frame-to-frame jump P95 (semitone) — octave-error sentinel
+    "global_rate_cps",    # speaking rate (chars / speech-second)
+    "local_rate_cv",      # within-utt rate variability
+    "pause_ratio",        # silent gap > 200ms total time / utt duration
+    # Verdict
+    "quality_score", "grade", "prosody_bucket",
+    # Status (always "ok" in train.jsonl; meaningful in rejected.jsonl)
     "status", "reject_reasons",
+    # Source-level metadata (useful for stratified sampling at train time)
     "language", "domain", "recording_type",
 ]
 
@@ -81,20 +93,52 @@ def _dedup(records: list[dict[str, Any]], threshold: float) -> tuple[list[dict[s
 
 def _assign_split(groups: list[tuple[Any, list[dict[str, Any]]]], ratios: dict[str, float],
                    rng: random.Random) -> dict[str, list[dict[str, Any]]]:
-    """Assign whole groups to train/valid/test based on cumulative durations."""
+    """Assign whole groups to splits without leakage.
+
+    Strategy: reserve one smallest group for each non-train split whose ratio>0
+    when group count permits (otherwise tiny corpora collapse all groups into
+    train and valid/test come out empty). Remaining groups go to whichever
+    split has the largest gap to its duration target.
+    """
     keys = list(groups)
+    if not keys:
+        return {k: [] for k in ratios}
     rng.shuffle(keys)
-    total_dur = sum(sum(float(r.get("duration", 0.0) or 0.0) for r in recs) for _, recs in keys)
+
+    def _gd(recs: list[dict[str, Any]]) -> float:
+        return sum(float(r.get("duration", 0.0) or 0.0) for r in recs)
+
+    total_dur = sum(_gd(recs) for _, recs in keys)
     target = {k: total_dur * float(v) for k, v in ratios.items()}
     accum = {k: 0.0 for k in ratios}
     out: dict[str, list[dict[str, Any]]] = {k: [] for k in ratios}
+    taken: set[Any] = set()
 
-    for _, recs in keys:
-        gd = sum(float(r.get("duration", 0.0) or 0.0) for r in recs)
-        # pick split with largest remaining capacity (relative)
-        best = max(ratios.keys(), key=lambda k: target[k] - accum[k])
+    non_train = [k for k in ratios if k != "train" and float(ratios[k]) > 0]
+    # Small-corpus guard: reserve the smallest group for each non-train split
+    # so target ratios that round to <1 group still produce a non-empty file.
+    smallest_first = sorted(keys, key=lambda kv: _gd(kv[1]))
+    for split in non_train:
+        # Stop if reserving would leave train with no group at all.
+        if len(taken) + 1 >= len(keys):
+            break
+        for k, recs in smallest_first:
+            if k in taken:
+                continue
+            out[split].extend(recs)
+            accum[split] += _gd(recs)
+            taken.add(k)
+            break
+
+    # Largest groups first so train absorbs the bulk before remainders fall to valid/test.
+    largest_first = sorted(keys, key=lambda kv: -_gd(kv[1]))
+    for k, recs in largest_first:
+        if k in taken:
+            continue
+        best = max(ratios.keys(), key=lambda s: target[s] - accum[s])
         out[best].extend(recs)
-        accum[best] += gd
+        accum[best] += _gd(recs)
+        taken.add(k)
     return out
 
 
@@ -158,25 +202,27 @@ def run(cfg) -> int:
     valid = list(assignment.get("valid", []))
     test = list(assignment.get("test", []))
 
-    # C-only goes into train with split_weight 0.5; keep leakage rule by group key
+    # C-only routes by source group: follow the group's existing assignment
+    # so we don't break leakage. Only train accepts C (low weight 0.5);
+    # any C whose group landed in valid/test is dropped from the keep set
+    # because valid/test must be A+B per design.md.
     c_groups: dict[Any, list[dict[str, Any]]] = {}
     for r in c_only:
         c_groups.setdefault(_group_key(r), []).append(r)
-    # If a C-group's key is already in valid/test, keep with that set group; otherwise train
-    valid_keys = {_group_key(r) for r in valid}
-    test_keys = {_group_key(r) for r in test}
+    train_keys = {_group_key(r) for r in train}
+    n_c_dropped = 0
     for k, recs in c_groups.items():
-        if k in valid_keys or k in test_keys:
-            # don't pollute valid/test with C; drop them to train anyway (low weight)
+        if k in train_keys:
             for r in recs:
                 rr = dict(r)
                 rr["split_weight"] = 0.5
                 train.append(rr)
         else:
-            for r in recs:
-                rr = dict(r)
-                rr["split_weight"] = 0.5
-                train.append(rr)
+            # group is in valid or test (or its key didn't appear in A/B at all);
+            # don't pollute valid/test with C, and don't add to train across leak boundary.
+            n_c_dropped += len(recs)
+    if n_c_dropped:
+        log.info(f"stage13: dropped {n_c_dropped} C-grade utts whose source landed in valid/test")
 
     # Project + write
     train_path = manifests_dir / "train.jsonl"

@@ -10,7 +10,7 @@ resample      -> + {audio_train_path, audio_align_path, train_sr, align_sr}
 vad_coarse    -> seg-level: {seg_id, source_audio_id, audio_align_path,
                   audio_train_path, speaker_id, speaker_label, start, end,
                   duration, diar_confidence}
-asr           -> + {asr_text, asr_text_normalized?, asr_confidence}
+asr           -> + {asr_text, asr_words?[]}    # asr_confidence dropped — HTTP service returns hardcoded 0.95
 text_normalize-> + {text_normalized, manual_text?, cer_vs_manual?}
 align         -> + {alignment_json_path, align_conf_mean, align_conf_p10,
                     high_conf_char_ratio, text_audio_duration_ratio}
