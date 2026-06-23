@@ -48,14 +48,22 @@ def _snr_db(audio: np.ndarray) -> float:
     )
     if energies.size == 0:
         return 0.0
-    p10 = float(np.percentile(energies, 10))
-    sig = energies[energies >= p10]
-    noi = energies[energies < p10]
-    if sig.size == 0 or noi.size == 0:
+    # For synthetic / concatenated audio there can be exact-zero silence frames.
+    # P10 may collapse to 0 and `energies < p10` is empty. Switch to a robust
+    # split: signal = top 30% by energy (definitely active speech), noise =
+    # bottom 30% strictly > 0 (or the smallest >0 frames if none meet the cut).
+    sig_thr = float(np.percentile(energies, 70))
+    sig = energies[energies >= sig_thr]
+    nonzero_noi = energies[(energies > 0) & (energies < sig_thr)]
+    if nonzero_noi.size == 0:
+        # No real noise frames detected — pure clean speech with synthetic
+        # zero silence. Treat as high SNR (cap at 40 dB).
+        return 40.0
+    sig_e = float(np.mean(sig)) if sig.size else 0.0
+    noi_e = float(np.percentile(nonzero_noi, 30)) + 1e-12
+    if sig_e <= 0:
         return 0.0
-    sig_e = float(np.mean(sig))
-    noi_e = float(np.mean(noi)) + 1e-12
-    return float(10.0 * np.log10(max(sig_e / noi_e, 1e-12)))
+    return float(min(40.0, 10.0 * np.log10(max(sig_e / noi_e, 1e-12))))
 
 
 def _peak_db(audio: np.ndarray) -> float:
@@ -72,10 +80,26 @@ def _clipping_ratio(audio: np.ndarray) -> float:
 
 
 def _effective_bw_hz(audio: np.ndarray, sr: int) -> float:
+    """95% cumulative spectral energy cut-off frequency.
+
+    Sample the middle 8 seconds of the recording (more representative of
+    sustained speech content than the first 1.5s, which often starts on
+    silence or a single character in concatenated clips). For very short
+    clips, use the whole signal. For high-SR files we downsample the
+    analysis window length, not the audio itself.
+    """
     if audio.size == 0:
         return 0.0
-    n = min(len(audio), 1 << 16)
-    seg = audio[:n]
+    target_samples = min(len(audio), 8 * sr)
+    if len(audio) <= target_samples:
+        seg = audio
+    else:
+        start = (len(audio) - target_samples) // 2
+        seg = audio[start : start + target_samples]
+    # Round up FFT size to a power of two for stability.
+    n = 1 << (len(seg) - 1).bit_length()
+    if n > len(seg):
+        seg = np.pad(seg, (0, n - len(seg)))
     spec = np.abs(np.fft.rfft(seg)) ** 2
     if float(np.sum(spec)) <= 0:
         return 0.0

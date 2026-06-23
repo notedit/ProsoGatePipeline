@@ -1,0 +1,11 @@
+audio_path,speaker_id,language,domain,recording_type,transcript_path
+data_test/aishell3/audio/SSB0693_part00.wav,SSB0693,zh,tts_corpus,studio,data_test/aishell3/text/SSB0693_part00.txt
+data_test/aishell3/audio/SSB0693_part01.wav,SSB0693,zh,tts_corpus,studio,data_test/aishell3/text/SSB0693_part01.txt
+data_test/aishell3/audio/SSB0702_part00.wav,SSB0702,zh,tts_corpus,studio,data_test/aishell3/text/SSB0702_part00.txt
+data_test/aishell3/audio/SSB0702_part01.wav,SSB0702,zh,tts_corpus,studio,data_test/aishell3/text/SSB0702_part01.txt
+data_test/aishell3/audio/SSB0711_part00.wav,SSB0711,zh,tts_corpus,studio,data_test/aishell3/text/SSB0711_part00.txt
+data_test/aishell3/audio/SSB0711_part01.wav,SSB0711,zh,tts_corpus,studio,data_test/aishell3/text/SSB0711_part01.txt
+data_test/aishell3/audio/SSB0716_part00.wav,SSB0716,zh,tts_corpus,studio,data_test/aishell3/text/SSB0716_part00.txt
+data_test/aishell3/audio/SSB0716_part01.wav,SSB0716,zh,tts_corpus,studio,data_test/aishell3/text/SSB0716_part01.txt
+data_test/aishell3/audio/SSB0717_part00.wav,SSB0717,zh,tts_corpus,studio,data_test/aishell3/text/SSB0717_part00.txt
+data_test/aishell3/audio/SSB0717_part01.wav,SSB0717,zh,tts_corpus,studio,data_test/aishell3/text/SSB0717_part01.txt

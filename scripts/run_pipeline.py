@@ -27,6 +27,7 @@ STAGES = [
     ("06_text_normalize", "Text Normalize"),
     ("07_align_qwen3", "Qwen3-ForcedAligner"),
     ("08_fine_segment", "Fine Segment"),
+    ("08b_mos", "MOS Filter"),
     ("09_spk_consistency", "Speaker Consistency"),
     ("10_extract_f0", "F0 Extract"),
     ("11_rate_metrics", "Rate Metrics"),
